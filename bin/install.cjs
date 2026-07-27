@@ -133,28 +133,64 @@ async function selectPlatform(rl, platforms) {
 
 async function installSkill(targetDir, platformName) {
   const skillDest = path.join(targetDir, SKILL_NAME);
-
-  // Check if already installed
-  if (fs.existsSync(skillDest)) {
-    logWarn(`${platformName} 已安装 ziwei skill`);
-    logInfo(`位置: ${skillDest}`);
-    return "exists";
-  }
+  const upgrading = fs.existsSync(skillDest);
 
   // Create skill directory
   fs.mkdirSync(skillDest, { recursive: true });
 
-  // Copy files
+  // Copy files（升级时覆盖，旧文件留 .bak 以防本地有手工修改）
   const filesToCopy = ["SKILL.md", "system-prompt.md"];
   for (const file of filesToCopy) {
     const src = path.join(PACKAGE_ROOT, file);
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, path.join(skillDest, file));
+    if (!fs.existsSync(src)) continue;
+
+    const dest = path.join(skillDest, file);
+    if (fs.existsSync(dest)) {
+      // 内容相同就不动，避免每次安装都刷一份 .bak
+      if (fs.readFileSync(dest, "utf8") === fs.readFileSync(src, "utf8")) continue;
+      fs.copyFileSync(dest, `${dest}.bak`);
     }
+    fs.copyFileSync(src, dest);
+  }
+
+  if (upgrading) {
+    logSuccess(`${platformName} Skill 已更新: ${skillDest}`);
+    logInfo("被覆盖的旧文档保留为 *.bak");
+    return "upgraded";
   }
 
   logSuccess(`Skill 已安装到: ${skillDest}`);
   return "installed";
+}
+
+/**
+ * 安装用户档案管理脚本（fortune-user）
+ *
+ * SKILL.md 里的「用户档案管理」一节写死了 ~/.openclaw/workspace/bin/fortune-user，
+ * 所以固定装到那个位置。档案数据库在 ~/.openclaw/workspace/fortune-users/fortune.db，
+ * 由脚本首次运行时自行创建 —— 不随包分发，每台机器各自独立。
+ */
+function installFortuneUser() {
+  const src = path.join(PACKAGE_ROOT, "bin", "fortune-user");
+  if (!fs.existsSync(src)) return false;
+
+  const destDir = path.join(HOME, ".openclaw", "workspace", "bin");
+  const dest = path.join(destDir, "fortune-user");
+
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.copyFileSync(src, dest);
+  fs.chmodSync(dest, 0o755);
+  logSuccess(`用户档案脚本已安装: ${dest}`);
+
+  // 依赖检查：脚本内部全部走 sqlite3，缺了会在运行时才失败
+  try {
+    execSync("command -v sqlite3", { stdio: "ignore", shell: "/bin/bash" });
+  } catch {
+    logWarn("未检测到 sqlite3 —— 用户档案记忆功能需要它");
+    logInfo("安装方式: apt install sqlite3 / brew install sqlite3");
+  }
+
+  return true;
 }
 
 async function installCli() {
@@ -176,8 +212,11 @@ async function installCli() {
 
     // Global install ensures dependencies are properly resolved
     // and persists after npx temp dir is cleaned up
-    logInfo("正在全局安装 ziwei CLI 及依赖...");
-    execSync("npm install -g ziwei-cli", { stdio: "inherit" });
+    // 固定装当前包的版本：不带版本号会解析成 registry 的 latest，
+    // 可能跟正在运行的这份 installer 不是同一个版本
+    const pkg = require(path.join(PACKAGE_ROOT, "package.json"));
+    logInfo(`正在全局安装 ziwei CLI v${pkg.version} 及依赖...`);
+    execSync(`npm install -g ziwei-cli@${pkg.version}`, { stdio: "inherit" });
     logSuccess("ziwei CLI 安装成功");
 
     // Verify
@@ -187,7 +226,7 @@ async function installCli() {
     return true;
   } catch (error) {
     logError(`CLI 安装失败: ${error.message}`);
-    logInfo("你可以手动运行: npm install -g ziwei-cli");
+    logInfo(`你可以手动运行: npm install -g ziwei-cli@${require(path.join(PACKAGE_ROOT, "package.json")).version}`);
     return false;
   }
 }
@@ -230,11 +269,19 @@ async function main() {
     // Step 2: Install skill files
     logStep("2/4", "安装 Skill 文件...");
 
+    let touchedOpenClaw = false;
     if (selected === "both") {
       await installSkill(CLAUDE_SKILLS_DIR, "Claude Code");
       await installSkill(OPENCLAW_SKILLS_DIR, "OpenClaw");
+      touchedOpenClaw = true;
     } else {
       await installSkill(selected.dir, selected.name);
+      touchedOpenClaw = selected.dir === OPENCLAW_SKILLS_DIR;
+    }
+
+    // SKILL.md 的「用户档案管理」一节依赖它，只在装 OpenClaw 时铺开
+    if (touchedOpenClaw) {
+      installFortuneUser();
     }
 
     // Step 3: Install CLI

@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ensure sqlite3 is in PATH
+export PATH="$HOME/.local/bin:$PATH"
+
+DB_DIR="$HOME/.openclaw/workspace/fortune-users"
+DB="$DB_DIR/fortune.db"
+
+# Ensure DB directory exists
+mkdir -p "$DB_DIR"
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+die() { echo "{\"error\":\"$(json_escape "$1")\"}" >&2; exit 1; }
+
+sql() { sqlite3 -batch "$DB" "$1"; }
+
+init_db() {
+    if [ ! -f "$DB" ]; then
+        sqlite3 "$DB" <<'SCHEMA'
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    channel TEXT NOT NULL,
+    channel_user_id TEXT NOT NULL,
+    name TEXT,
+    birth_date TEXT,
+    birth_time TEXT,
+    gender TEXT,
+    city TEXT,
+    is_lunar INTEGER DEFAULT 0,
+    notes TEXT,
+    free_queries_used INTEGER DEFAULT 0,
+    free_queries_limit INTEGER DEFAULT 5,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(channel, channel_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS people (
+    id INTEGER PRIMARY KEY,
+    owner_channel TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    birth_date TEXT,
+    birth_time TEXT,
+    gender TEXT,
+    city TEXT,
+    is_lunar INTEGER DEFAULT 0,
+    relation TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (owner_channel, owner_user_id) REFERENCES users(channel, channel_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY,
+    channel TEXT NOT NULL,
+    channel_user_id TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    starts_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (channel, channel_user_id) REFERENCES users(channel, channel_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL,
+    channel_user_id TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    amount TEXT,
+    currency TEXT,
+    chain TEXT,
+    txhash TEXT,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    verified_at TEXT,
+    FOREIGN KEY (channel, channel_user_id) REFERENCES users(channel, channel_user_id)
+);
+SCHEMA
+    fi
+}
+
+ensure_user() {
+    local channel="$1" user_id="$2"
+    sql "INSERT OR IGNORE INTO users (channel, channel_user_id) VALUES ('$(json_escape "$channel")', '$(json_escape "$user_id")');"
+}
+
+# Plan duration in days
+plan_days() {
+    case "$1" in
+        monthly)   echo 30;;
+        quarterly) echo 90;;
+        yearly)    echo 365;;
+        *)         die "Invalid plan: $1";;
+    esac
+}
+
+plan_price() {
+    case "$1" in
+        monthly)   echo "88";;
+        quarterly) echo "218";;
+        yearly)    echo "988";;
+        *)         die "Invalid plan: $1";;
+    esac
+}
+
+# Wallet addresses
+WALLET_ERC20="0x166330a342df88932448dbbd44092a18b944af48"
+WALLET_TRC20="TRXpfrjBqcjA2KMANsnrNwUzV6UYZpF34F"
+
+# ── subcommands ──────────────────────────────────────────────────────────────
+
+cmd_gate() {
+    local channel="${1:-}" user_id="${2:-}" agent=""
+    # Parse optional --agent flag
+    shift 2 2>/dev/null || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --agent) agent="$2"; shift 2;;
+            *)       shift;;
+        esac
+    done
+
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user gate <channel> <user_id> [--agent <agent_id>]"
+
+    # Owner bypass: main agent (personal assistant) always allowed
+    if [ "$agent" = "main" ]; then
+        echo "{\"allowed\":true,\"plan\":\"owner\",\"expires_at\":\"never\"}"
+        return
+    fi
+
+    ensure_user "$channel" "$user_id"
+
+    # Check active subscription
+    local sub
+    sub=$(sql "SELECT plan, expires_at FROM subscriptions WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")' AND status='active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1;")
+
+    if [ -n "$sub" ]; then
+        local plan expires_at
+        plan=$(echo "$sub" | cut -d'|' -f1)
+        expires_at=$(echo "$sub" | cut -d'|' -f2)
+        echo "{\"allowed\":true,\"plan\":\"$plan\",\"expires_at\":\"$expires_at\"}"
+    else
+        echo "{\"allowed\":false,\"reason\":\"no_subscription\",\"wallet_erc20\":\"$WALLET_ERC20\",\"wallet_trc20\":\"$WALLET_TRC20\",\"plans\":{\"monthly\":\"88 USDT\",\"quarterly\":\"218 USDT\",\"yearly\":\"988 USDT\"}}"
+    fi
+}
+
+cmd_profile() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user profile <channel> <user_id>"
+
+    local row
+    row=$(sqlite3 -json "$DB" "SELECT channel, channel_user_id, name, birth_date, birth_time, gender, city, is_lunar, notes, free_queries_used, free_queries_limit, created_at, updated_at FROM users WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")' LIMIT 1;" 2>/dev/null || true)
+
+    if [ -z "$row" ] || [ "$row" = "[]" ]; then
+        echo "{}"
+    else
+        # sqlite3 -json returns an array; extract first element
+        if command -v jq &>/dev/null; then
+            echo "$row" | jq '.[0]'
+        else
+            # Strip leading [ and trailing ]
+            local inner="${row#[}"
+            inner="${inner%]}"
+            echo "$inner"
+        fi
+    fi
+}
+
+cmd_save() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user save <channel> <user_id> --name <name> --date <date> ..."
+    shift 2
+
+    local name="" date="" time="" gender="" city="" lunar=0 notes=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)   name="$2"; shift 2;;
+            --date)   date="$2"; shift 2;;
+            --time)   time="$2"; shift 2;;
+            --gender) gender="$2"; shift 2;;
+            --city)   city="$2"; shift 2;;
+            --lunar)  lunar=1; shift;;
+            --notes)  notes="$2"; shift 2;;
+            *)        die "Unknown option: $1";;
+        esac
+    done
+
+    ensure_user "$channel" "$user_id"
+
+    sql "UPDATE users SET
+        name='$(json_escape "$name")',
+        birth_date='$(json_escape "$date")',
+        birth_time='$(json_escape "$time")',
+        gender='$(json_escape "$gender")',
+        city='$(json_escape "$city")',
+        is_lunar=$lunar,
+        notes='$(json_escape "$notes")',
+        updated_at=datetime('now')
+        WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")';"
+
+    echo "{\"ok\":true,\"message\":\"Profile saved\"}"
+}
+
+cmd_people() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user people <channel> <user_id>"
+
+    local rows
+    rows=$(sqlite3 -json "$DB" "SELECT id, name, birth_date, birth_time, gender, city, is_lunar, relation, created_at FROM people WHERE owner_channel='$(json_escape "$channel")' AND owner_user_id='$(json_escape "$user_id")' ORDER BY created_at DESC;" 2>/dev/null || true)
+
+    if [ -z "$rows" ] || [ "$rows" = "[]" ]; then
+        echo "[]"
+    else
+        echo "$rows"
+    fi
+}
+
+cmd_save_person() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user save-person <channel> <user_id> --name <name> ..."
+    shift 2
+
+    local name="" date="" time="" gender="" city="" lunar=0 relation=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)     name="$2"; shift 2;;
+            --date)     date="$2"; shift 2;;
+            --time)     time="$2"; shift 2;;
+            --gender)   gender="$2"; shift 2;;
+            --city)     city="$2"; shift 2;;
+            --lunar)    lunar=1; shift;;
+            --relation) relation="$2"; shift 2;;
+            *)          die "Unknown option: $1";;
+        esac
+    done
+
+    [ -z "$name" ] && die "Name is required"
+
+    ensure_user "$channel" "$user_id"
+
+    local pid
+    pid=$(sqlite3 -batch "$DB" "INSERT INTO people (owner_channel, owner_user_id, name, birth_date, birth_time, gender, city, is_lunar, relation)
+         VALUES ('$(json_escape "$channel")', '$(json_escape "$user_id")', '$(json_escape "$name")', '$(json_escape "$date")', '$(json_escape "$time")', '$(json_escape "$gender")', '$(json_escape "$city")', $lunar, '$(json_escape "$relation")');
+         SELECT last_insert_rowid();")
+    echo "{\"ok\":true,\"person_id\":$pid,\"message\":\"Person saved\"}"
+}
+
+cmd_usage() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user usage <channel> <user_id>"
+
+    ensure_user "$channel" "$user_id"
+
+    local used limit
+    used=$(sql "SELECT free_queries_used FROM users WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")';")
+    limit=$(sql "SELECT free_queries_limit FROM users WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")';")
+
+    local free_remaining=$(( limit - used ))
+    [ "$free_remaining" -lt 0 ] && free_remaining=0
+
+    # Check active subscription
+    local sub
+    sub=$(sql "SELECT plan, expires_at FROM subscriptions WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")' AND status='active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1;")
+
+    local is_paid="false" plan="free" expires_at="null"
+    if [ -n "$sub" ]; then
+        is_paid="true"
+        plan=$(echo "$sub" | cut -d'|' -f1)
+        expires_at=$(echo "$sub" | cut -d'|' -f2)
+    fi
+
+    if [ "$expires_at" = "null" ]; then
+        echo "{\"free_remaining\":$free_remaining,\"is_paid\":$is_paid,\"plan\":\"$plan\",\"expires_at\":null}"
+    else
+        echo "{\"free_remaining\":$free_remaining,\"is_paid\":$is_paid,\"plan\":\"$plan\",\"expires_at\":\"$expires_at\"}"
+    fi
+}
+
+cmd_record_usage() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user record-usage <channel> <user_id>"
+
+    ensure_user "$channel" "$user_id"
+
+    sql "UPDATE users SET free_queries_used = free_queries_used + 1, updated_at = datetime('now') WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")';"
+
+    cmd_usage "$channel" "$user_id"
+}
+
+cmd_pay() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user pay <channel> <user_id> --plan <plan> ..."
+    shift 2
+
+    local plan="" txhash="" chain="" amount="" currency=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --plan)     plan="$2"; shift 2;;
+            --txhash)   txhash="$2"; shift 2;;
+            --chain)    chain="$2"; shift 2;;
+            --amount)   amount="$2"; shift 2;;
+            --currency) currency="$2"; shift 2;;
+            *)          die "Unknown option: $1";;
+        esac
+    done
+
+    [ -z "$plan" ] && die "Plan is required"
+    [ -z "$txhash" ] && die "Transaction hash is required"
+    [ -z "$chain" ] && die "Chain is required (erc20|trc20)"
+
+    # Validate plan
+    plan_price "$plan" >/dev/null
+
+    ensure_user "$channel" "$user_id"
+
+    # Generate a unique payment ID
+    local payment_id
+    payment_id="pay_$(date +%s)_$RANDOM"
+
+    local expected_price
+    expected_price=$(plan_price "$plan")
+
+    local wallet=""
+    case "$chain" in
+        erc20) wallet="$WALLET_ERC20";;
+        trc20) wallet="$WALLET_TRC20";;
+        *)     die "Invalid chain: $chain. Use erc20 or trc20";;
+    esac
+
+    sql "INSERT INTO payments (id, channel, channel_user_id, plan, amount, currency, chain, txhash, status)
+         VALUES ('$(json_escape "$payment_id")', '$(json_escape "$channel")', '$(json_escape "$user_id")', '$(json_escape "$plan")', '$(json_escape "$amount")', '$(json_escape "$currency")', '$(json_escape "$chain")', '$(json_escape "$txhash")', 'pending');"
+
+    echo "{\"ok\":true,\"payment_id\":\"$payment_id\",\"expected_amount\":\"$expected_price\",\"wallet\":\"$wallet\",\"status\":\"pending\"}"
+}
+
+cmd_verify_payment() {
+    local payment_id="${1:-}"
+    [ -z "$payment_id" ] && die "Usage: fortune-user verify-payment <payment_id>"
+
+    local exists
+    exists=$(sql "SELECT COUNT(*) FROM payments WHERE id='$(json_escape "$payment_id")';")
+    [ "$exists" -eq 0 ] && die "Payment not found: $payment_id"
+
+    local status
+    status=$(sql "SELECT status FROM payments WHERE id='$(json_escape "$payment_id")';")
+    [ "$status" != "pending" ] && die "Payment is not pending (current status: $status)"
+
+    sql "UPDATE payments SET status='verified', verified_at=datetime('now') WHERE id='$(json_escape "$payment_id")';"
+
+    # Get payment info to activate subscription
+    local info
+    info=$(sql "SELECT channel, channel_user_id, plan FROM payments WHERE id='$(json_escape "$payment_id")';")
+    local p_channel p_user_id p_plan
+    p_channel=$(echo "$info" | cut -d'|' -f1)
+    p_user_id=$(echo "$info" | cut -d'|' -f2)
+    p_plan=$(echo "$info" | cut -d'|' -f3)
+
+    # Auto-activate subscription upon verification
+    local days
+    days=$(plan_days "$p_plan")
+
+    # Check if there's an existing active subscription to extend from
+    local current_expiry
+    current_expiry=$(sql "SELECT expires_at FROM subscriptions WHERE channel='$(json_escape "$p_channel")' AND channel_user_id='$(json_escape "$p_user_id")' AND status='active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1;")
+
+    local start_from
+    if [ -n "$current_expiry" ]; then
+        start_from="$current_expiry"
+    else
+        start_from=$(date -u +"%Y-%m-%d %H:%M:%S")
+    fi
+
+    sql "INSERT INTO subscriptions (channel, channel_user_id, plan, status, starts_at, expires_at)
+         VALUES ('$(json_escape "$p_channel")', '$(json_escape "$p_user_id")', '$(json_escape "$p_plan")', 'active', '$start_from', datetime('$start_from', '+$days days'));"
+
+    local new_expiry
+    new_expiry=$(sql "SELECT expires_at FROM subscriptions WHERE channel='$(json_escape "$p_channel")' AND channel_user_id='$(json_escape "$p_user_id")' AND status='active' ORDER BY expires_at DESC LIMIT 1;")
+
+    echo "{\"ok\":true,\"payment_id\":\"$payment_id\",\"status\":\"verified\",\"subscription_expires_at\":\"$new_expiry\"}"
+}
+
+cmd_activate() {
+    local channel="${1:-}" user_id="${2:-}"
+    [ -z "$channel" ] || [ -z "$user_id" ] && die "Usage: fortune-user activate <channel> <user_id> --plan <plan>"
+    shift 2
+
+    local plan=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --plan) plan="$2"; shift 2;;
+            *)      die "Unknown option: $1";;
+        esac
+    done
+
+    [ -z "$plan" ] && die "Plan is required"
+
+    local days
+    days=$(plan_days "$plan")
+
+    ensure_user "$channel" "$user_id"
+
+    # Check existing active subscription
+    local current_expiry
+    current_expiry=$(sql "SELECT expires_at FROM subscriptions WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")' AND status='active' AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1;")
+
+    local start_from
+    if [ -n "$current_expiry" ]; then
+        start_from="$current_expiry"
+    else
+        start_from=$(date -u +"%Y-%m-%d %H:%M:%S")
+    fi
+
+    sql "INSERT INTO subscriptions (channel, channel_user_id, plan, status, starts_at, expires_at)
+         VALUES ('$(json_escape "$channel")', '$(json_escape "$user_id")', '$(json_escape "$plan")', 'active', '$start_from', datetime('$start_from', '+$days days'));"
+
+    local new_expiry
+    new_expiry=$(sql "SELECT expires_at FROM subscriptions WHERE channel='$(json_escape "$channel")' AND channel_user_id='$(json_escape "$user_id")' AND status='active' ORDER BY expires_at DESC LIMIT 1;")
+
+    echo "{\"ok\":true,\"plan\":\"$plan\",\"expires_at\":\"$new_expiry\"}"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+init_db
+
+subcmd="${1:-}"
+[ -z "$subcmd" ] && die "Usage: fortune-user <profile|save|people|save-person|usage|record-usage|pay|verify-payment|activate> ..."
+shift
+
+case "$subcmd" in
+    gate)           cmd_gate "$@";;
+    profile)        cmd_profile "$@";;
+    save)           cmd_save "$@";;
+    people)         cmd_people "$@";;
+    save-person)    cmd_save_person "$@";;
+    usage)          cmd_usage "$@";;
+    record-usage)   cmd_record_usage "$@";;
+    pay)            cmd_pay "$@";;
+    verify-payment) cmd_verify_payment "$@";;
+    activate)       cmd_activate "$@";;
+    *)              die "Unknown command: $subcmd";;
+esac
